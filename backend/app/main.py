@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+
 import httpx
 from fastapi import Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,13 @@ from .uploads import UploadError, read_limited, validate_content
 logger = logging.getLogger("vajra")
 
 app = FastAPI(title="VAJRA Privacy API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ALLOWED = {".png", ".jpg", ".jpeg", ".pdf", ".docx"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
