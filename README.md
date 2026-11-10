@@ -1,6 +1,6 @@
 # VAJRA — Digital Privacy & Exposure Check (student prototype)
 
-A runnable prototype of a women-focused privacy self-check tool. It combines:
+A runnable prototype for self-check tool. It combines:
 - **File privacy scanning** for images, PDFs and DOCX files: metadata inspection plus simple pattern checks for personal data.
 - A **small footprint check** that validates identifiers you type in and, if you supply your own key, looks up one email in Have I Been Pwned.
 - A **transparent, rule-based risk score** with practical recommendations.
