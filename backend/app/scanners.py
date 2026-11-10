@@ -1,39 +1,33 @@
-import re
-from pathlib import Path
+from io import BytesIO
+
 from PIL import Image
-import fitz
-from docx import Document
 
-EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-PHONE_RE = re.compile(r"(?<!\d)(?:\+91[\s-]?)?[6-9]\d{9}(?!\d)")
-PAN_RE = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", re.I)
-AADHAAR_RE = re.compile(r"(?<!\d)\d{4}[\s-]?\d{4}[\s-]?\d{4}(?!\d)")
+from .pii import pii_findings  # re-exported for backwards compatibility
+from .uploads import check_image_size
 
-def pii_findings(text: str):
-    findings = []
-    patterns = [
-        ("email", EMAIL_RE, "direct_contact", "Email address pattern detected"),
-        ("phone", PHONE_RE, "direct_contact", "Possible Indian mobile number detected"),
-        ("PAN-like", PAN_RE, "identity_document", "PAN-like pattern detected"),
-        ("Aadhaar-like", AADHAAR_RE, "identity_document", "12-digit Aadhaar-like pattern detected"),
-    ]
-    for kind, pattern, category, message in patterns:
-        matches = list(dict.fromkeys(pattern.findall(text)))
-        for match in matches[:10]:
-            findings.append({
-                "title": message,
-                "category": kind,
-                "risk_category": category,
-                "severity": "High" if category == "identity_document" else "Moderate",
-                "evidence": f"Matched value: {match[:3]}••••",
-                "recommendation": "Review whether this information needs to be visible before sharing."
-            })
-    return findings
+MAX_PDF_PAGES = 200
+MAX_TEXT_CHARS = 5_000_000
 
-def scan_image(path: Path):
+GPS_IFD = 0x8825  # EXIF pointer to the GPS sub-block (decimal 34853)
+GPS_LATITUDE, GPS_LONGITUDE = 2, 4
+
+
+def _finding(title, category, risk_category, severity, evidence, recommendation):
+    return {
+        "title": title,
+        "category": category,
+        "risk_category": risk_category,
+        "severity": severity,
+        "evidence": evidence,
+        "recommendation": recommendation,
+    }
+
+
+def scan_image(data: bytes):
     findings = []
     details = {"format": None, "width": None, "height": None, "metadata": []}
-    with Image.open(path) as image:
+    with Image.open(BytesIO(data)) as image:
+        check_image_size(image.width, image.height)
         details.update({"format": image.format, "width": image.width, "height": image.height})
         exif = image.getexif()
         if exif:
@@ -41,52 +35,95 @@ def scan_image(path: Path):
                 # Avoid displaying raw binary metadata.
                 if isinstance(value, (str, int, float)):
                     details["metadata"].append({"tag": str(key), "value": str(value)[:120]})
-            gps = exif.get(34853)
-            if gps:
-                findings.append({
-                    "title": "GPS metadata may be present",
-                    "category": "location metadata",
-                    "risk_category": "precise_location",
-                    "severity": "High",
-                    "evidence": "Image contains a GPS metadata block.",
-                    "recommendation": "Remove location metadata before sharing if it is not needed."
-                })
-            findings.append({
-                "title": "Image contains EXIF metadata",
-                "category": "device metadata",
-                "risk_category": "device_metadata",
-                "severity": "Low",
-                "evidence": f"{len(exif)} EXIF fields detected.",
-                "recommendation": "Consider sharing a metadata-cleaned copy."
-            })
+            gps = {}
+            try:
+                gps = dict(exif.get_ifd(GPS_IFD))
+            except Exception:
+                gps = {}
+            if GPS_LATITUDE in gps and GPS_LONGITUDE in gps:
+                findings.append(_finding(
+                    "GPS location found in image metadata", "location metadata",
+                    "precise_location", "High",
+                    "Image metadata contains latitude and longitude fields.",
+                    "Remove location metadata before sharing if it is not needed."))
+            elif GPS_IFD in exif:
+                findings.append(_finding(
+                    "GPS metadata block present but no coordinates found",
+                    "location metadata", "device_metadata", "Low",
+                    "A GPS block exists but latitude/longitude fields were not found.",
+                    "Consider sharing a metadata-cleaned copy."))
+            findings.append(_finding(
+                "Image contains EXIF metadata", "device metadata", "device_metadata", "Low",
+                f"{len(exif)} EXIF fields detected.",
+                "Consider sharing a metadata-cleaned copy."))
     return details, findings
 
-def scan_pdf(path: Path):
-    findings = []
-    text = ""
-    with fitz.open(path) as doc:
-        metadata = doc.metadata or {}
-        for page in doc:
-            text += page.get_text() + "\n"
-    findings.extend(pii_findings(text))
-    return {"pages": len(fitz.open(path)), "metadata": {k: str(v)[:150] for k, v in metadata.items() if v}}, findings
 
-def scan_docx(path: Path):
-    doc = Document(path)
-    text = "\n".join(p.text for p in doc.paragraphs)
+def scan_pdf(data: bytes):
+    import fitz  # PyMuPDF; imported lazily so other scanners work without it
+
+    findings = []
+    notes = []
+    text_parts = []
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        if doc.needs_pass:
+            findings.append(_finding(
+                "PDF is password-protected; contents were not scanned",
+                "scan limitation", None, "Low",
+                "VAJRA cannot read encrypted PDFs.",
+                "Scan an unprotected copy if you want its contents checked."))
+            return {"pages": None, "encrypted": True, "metadata": {}}, findings
+        raw_meta = doc.metadata or {}
+        pages = len(doc)
+        total = 0
+        for index, page in enumerate(doc):
+            if index >= MAX_PDF_PAGES:
+                notes.append(f"Only the first {MAX_PDF_PAGES} pages were scanned.")
+                break
+            page_text = page.get_text()
+            total += len(page_text)
+            text_parts.append(page_text)
+            if total > MAX_TEXT_CHARS:
+                notes.append("Text scanning stopped at a size limit.")
+                break
+    text = "\n".join(text_parts)
+    if pages and not text.strip():
+        notes.append("No extractable text layer found; scanned/image-only pages are not "
+                     "analysed because OCR is not implemented.")
+    findings.extend(pii_findings(text))
+    metadata = {k: str(v)[:150] for k, v in raw_meta.items() if v}
+    if any(raw_meta.get(k) for k in ("author", "title", "subject", "keywords")):
+        findings.append(_finding(
+            "Document author or descriptive metadata is present", "document metadata",
+            "device_metadata", "Low", "One or more document properties are populated.",
+            "Review document properties before publishing."))
+    details = {"pages": pages, "metadata": metadata}
+    if notes:
+        details["notes"] = notes
+    return details, findings
+
+
+def scan_docx(data: bytes):
+    from docx import Document
+
+    doc = Document(BytesIO(data))
+    parts = [p.text for p in doc.paragraphs]
     for table in doc.tables:
         for row in table.rows:
-            text += "\n" + " ".join(cell.text for cell in row.cells)
+            parts.append(" ".join(cell.text for cell in row.cells))
+    for section in doc.sections:  # headers/footers often hold names and phone numbers
+        for part in (section.header, section.footer):
+            parts.extend(p.text for p in part.paragraphs)
+    text = "\n".join(parts)[:MAX_TEXT_CHARS]
     findings = pii_findings(text)
     props = doc.core_properties
-    metadata = {"author": props.author, "last_modified_by": props.last_modified_by, "title": props.title, "subject": props.subject}
+    metadata = {
+        "author": props.author, "last_modified_by": props.last_modified_by,
+        "title": props.title, "subject": props.subject,
+    }
     if any(metadata.values()):
-        findings.append({
-            "title": "Document author or descriptive metadata is present",
-            "category": "document metadata",
-            "risk_category": "device_metadata",
-            "severity": "Low",
-            "evidence": "One or more document properties are populated.",
-            "recommendation": "Review document properties before publishing."
-        })
+        findings.append(_finding(
+            "Document author or descriptive metadata is present", "document metadata",
+            "device_metadata", "Low", "One or more document properties are populated.",
+            "Review document properties before publishing."))
     return {"paragraphs": len(doc.paragraphs), "metadata": metadata}, findings

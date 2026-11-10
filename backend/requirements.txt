@@ -6,3 +6,6 @@ pymupdf==1.25.5
 python-docx==1.1.2
 python-dotenv==1.1.0
 httpx==0.28.1
+# Needed by app/ai_engine.py and check_models.py. It was missing from the original file.
+# Version range not verified in an offline environment; pin the exact version after `pip freeze`.
+google-genai>=1.0.0
